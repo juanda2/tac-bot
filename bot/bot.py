@@ -1,15 +1,5 @@
 #! /usr/bin/python
 """
-    boilerplate_sparkbot
-
-    This is a sample boilerplate application that provides the framework to quickly
-    build and deploy an interactive Spark Bot.
-
-    There are different strategies for building a Spark Bot.  You can either create
-    a new dedicated Spark Account for the bot, or create an "Bot Account" underneath
-    another Spark Account.  Either type will work with this boilerplate, just be sure
-    to provide the correct token and email account in the configuration.
-
     This Bot will use a provided Spark Account (identified by the Developer Token)
     and create a webhook to receive all messages sent to the account.   You will
     specify a set of command words that the Bot will "listen" for.  Any other message
@@ -34,15 +24,12 @@
     export SPARK_BOT_APP_NAME="imapex bot"
 
     If you are running the bot within a docker container, they would be set like this:
-    # ToDo - Add docker run command
     docker run -it --name sparkbot \
     -e "SPARK_BOT_EMAIL=myhero.demo@domain.com" \
     -e "SPARK_BOT_TOKEN=adfiafdadfadfaij12321kaf" \
     -e "SPARK_BOT_URL=http://myhero-spark.mantl.domain.com" \
     -e "SPARK_BOT_APP_NAME='imapex bot'" \
     sparkbot
-
-    # ToDo - API call for configuring the Spark info
 
     In cases where storing the Spark Email and Token as Environment Variables could
     be a security risk, you can alternatively set them via a REST request.
@@ -61,22 +48,48 @@ from ciscosparkapi import CiscoSparkAPI
 import os
 import sys
 import json
-import requests
-import re
+from datetime import datetime, timedelta
+from utilities import check_cisco_user, verify_case_number, get_case_details, room_exists_for_user, create_membership, \
+                        get_email, get_person_id, create_room, get_room_name, extract_message, get_case_number, \
+                        invite_user, check_email_syntax
+from case import CaseDetail
 
 # Create the Flask application that provides the bot foundation
 app = Flask(__name__)
+
+
+# ToDos:
+    # todo accept multiple case numbers, loop through cases?
+    # todo add test cases for low hanging fruit in testing.py
+    # todo timezone for tac engineer
+    # todo add security check to match domain of user to case contact
+    # todo start PSTS engagement
+    # todo last note created with "action plan" or "next steps" in note detail
+    # todo add RMA API functions
+    # todo monitor case and alert on changes
 
 
 # The list of commands the bot listens for
 # Each key in the dictionary is a command
 # The value is the help message sent for the command
 commands = {
-    "/title": "Get title for TAC case number provided, if none provided will look for one in room name.",
-    "/owner": "Get case owner for TAC case number provided, if none provided will look for one in room name.",
-    "/echo": "Reply back with the same message sent.",
-    "/help": "Get help.",
-	"/test": "Print test message."
+    "/title": "Get title for TAC case.",
+    "/description": "Get problem description for the TAC case.",
+    "/owner": "Get case owner (TAC CSE) for TAC case.",
+    "/contract": "Get contract number associated with the TAC case.",
+    "/customer": "Get customer contact info for the TAC case.",
+    "/status": "Get status and severity for the TAC case.",
+    "/rma": "Get list of RMAs associated with TAC case.",
+    "/bug": "Get list of Bugs associated with TAC case.",
+    "/device": "Get serial number and hostname for the device on which the TAC case was opened",
+    "/created": "Get the date on which the TAC case was created, and calculate the open duration",
+    "/updated": "Get the date on which the TAC case was last updated, and calculate the time since last update",
+    "/invite": "Invite new user to room by email (or keywords: cse=case owner)",
+    "/link": "Get link to the case in Support Case Manager",
+    "/feedback": "Sends feedback to development team; use this to submit feature requests and bugs",
+    # "/echo": "Reply back with the same message sent.",
+    # "/test": "Print test message.",
+    "/help": "Get help."
 }
 
 
@@ -160,7 +173,71 @@ def health_check():
     """
     return "Up and healthy"
 
+
 # REST API for room creation
+@app.route("/create/<provided_case_number>/<email>", methods=["GET"])
+def create(provided_case_number, email):
+    """
+    Start new room for case number and user
+    :param provided_case_number, email:
+    :return:
+    """
+    # Check if the Spark connection has been made
+    if spark is None:
+        sys.stderr.write("Bot not ready.  \n")
+        return "Spark Bot not ready.  "
+
+    # Check if provided case number is valid
+    case_number = verify_case_number(provided_case_number)
+    if case_number:
+        # Get person ID for email provided
+        person_id = get_person_id(email)
+        if person_id:
+            #sys.stderr.write("Person ID for email ("+email+"): "+person_id+"\n")
+
+            # Check if room already exists for case and  user
+            room_id = room_exists_for_user(case_number, email)
+            if room_id:
+                message = "Room already exists with  "+case_number+" in the title and "+email+" already a member.\n"
+                sys.stderr.write(message)
+                sys.stderr.write("roomId: "+room_id+"\n")
+            else:
+                # Create the new room
+                room_id = create_room(case_number)
+                message = "Created roomId: "+room_id+"\n"
+                sys.stderr.write(message)
+
+                # Add user to the room
+                membership_id = create_membership(person_id, room_id)
+                membership_message = email+" added to the room.\n"
+                sys.stderr.write(membership_message)
+                sys.stderr.write("membershipId: "+membership_id+"\n")
+                message = message+membership_message
+
+            # Print Welcome message to room
+            spark.messages.create(roomId=room_id, markdown=send_help(False))
+            welcome_message = "Welcome message (with help command) sent to the room.\n"
+            sys.stderr.write(welcome_message)
+            message = message+welcome_message
+        else:
+            message = "No user found with the email address: "+email
+            sys.stderr.write(message)
+    else:
+        message = provided_case_number+" is not a valid case number"
+        sys.stderr.write(message)
+
+    return message
+
+
+# Room counter - returns the number of rooms for which TAC bot is a member
+# Useful for tracking utilization of TAC bot
+@app.route("/rooms", methods=["GET"])
+def room_count():
+    """
+    Notify if bot is up
+    :return:
+    """
+    return "{}\n".format(sum(1 for x in spark.rooms.list()))
 
 
 # Function to Setup the WebHook for the bot
@@ -207,7 +284,7 @@ def process_incoming_message(post_data):
         return ""
 
     # Log details on message
-    sys.stderr.write("Message from: " + message.personEmail + "\n")
+    sys.stderr.write("Message from {}: {}\n".format(message.personEmail, message.text))
 
     # Find the command that was sent, if any
     command = ""
@@ -223,81 +300,647 @@ def process_incoming_message(post_data):
     # If no command found, send help
     if command in ["", "/help"]:
         reply = send_help(post_data)
-    elif command in ["/echo"]:
-        reply = send_echo(message)
-    elif command in ["/test"]:
-        reply = send_test()
+        sys.stderr.write("Sent help message")
+    # elif command in ["/echo"]:
+        # reply = send_echo(message)
+    # elif command in ["/test"]:
+        # reply = send_test()
     elif command in ["/title"]:
         reply = send_title(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
     elif command in ["/owner"]:
         reply = send_owner(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/description"]:
+        reply = send_description(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/contract"]:
+        reply = send_contract(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/customer"]:
+        reply = send_customer(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/status"]:
+        reply = send_status(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/rma"]:
+        reply = send_rma_numbers(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/feedback"]:
+        # If feedback is blank, dont send it
+        feedback = send_feedback(post_data, "feedback")
+        feedback_room = os.environ.get("FEEDBACK_ROOM")
+        if feedback is not None:
+            spark.messages.create(roomId=feedback_room, markdown=feedback)
+            reply = send_feedback(post_data, "reply")
+        else:
+            reply = "Sorry, cannot submit blank feedback"
+    elif command in ["/created"]:
+        reply = send_created(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/updated"]:
+        reply = send_updated(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/device"]:
+        reply = send_device(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/bug"]:
+        reply = send_bug(post_data)
+        sys.stderr.write("Replied to {} with:\n{}\n".format(message.personEmail, reply))
+    elif command in ["/link"]:
+        reply = send_link(post_data)
+    elif command in ["/invite"]:
+        reply = send_invite(post_data)
 
     # send_message_to_room(room_id, reply)
     spark.messages.create(roomId=room_id, markdown=reply)
 
-# Command function that returns TAC case title for provided case number
-def send_title(post_data):
+
+#
+# Command functions
+#
+
+# Sends feedback to Bot developers and replies with confirmation
+def send_feedback(post_data, type):
     # Determine the Spark Room to send reply to
     room_id = post_data["data"]["roomId"]
 
     # Get the details about the message that was sent.
     message_id = post_data["data"]["id"]
-    message = spark.messages.get(message_id)
-    content = extract_message("/title", message.text)
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/feedback", message_in.text)
 
-    # Check if case number is found in message
-    case_number = get_case_number(content)
-    if case_number:
-        case_title = get_case_title(case_number)
-        if case_title:
-            message = "Title for SR "+str(case_number)+" is: "+case_title
+    # Get personId of the person submitting feedback
+    person_id = post_data["data"]["personId"]
+
+    if type == "feedback":
+        email = get_email(person_id)
+        if content:
+            message = "User {} provided the following feedback:<br>{}".format(email, content)
         else:
-            message = "No case found with SR "+case_number
+            message = None
+    elif type == "reply":
+        message = "Thank you. Your feedback has been sent to developers"
     else:
-        # If case number not provided in message, use room name
-        room_name = get_room_name(room_id)
-        case_number = get_case_number(room_name)
-        if case_number:        
-            case_title = get_case_title(case_number)
-            if case_title:
-                message = "Title for SR "+str(case_number)+" is: "+case_title
-            else:
-                message = "No case found with SR "+str(case_number)
-        else:
-            message = "Sorry, no case number was found."
+        message = None
 
     return message
 
-# Command function that returns the owner of the TAC case number provided
-def send_owner(post_data):
+
+# Sends feedback to Bot developers and replies with confirmation
+def send_link(post_data):
     # Determine the Spark Room to send reply to
     room_id = post_data["data"]["roomId"]
 
     # Get the details about the message that was sent.
     message_id = post_data["data"]["id"]
-    message = spark.messages.get(message_id)
-    content = extract_message("/owner", message.text)
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/link", message_in.text)
 
-    # Check if case number is found in message
-    case_number = get_case_number(content)
+    # Get personId of the person submitting feedback
+    person_id = post_data["data"]["personId"]
+
+    external_link_url = "https://mycase.cloudapps.cisco.com/"
+    internal_link_url = "http://mwz.cisco.com/"
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
     if case_number:
-        case_owner = get_case_owner(case_number)
-        if case_owner:
-            message = "Case owner for SR "+str(case_number)+" is: "+case_owner
-        else:
-            message = "No case found with SR "+case_number
+        message = "* Externally accessible link: {}{}\n".format(external_link_url, case_number)
+        message = message + "* Internal link: {}{}".format(internal_link_url, case_number)
     else:
-        # If case number not provided in message, use room name
-        room_name = get_room_name(room_id)
-        case_number = get_case_number(room_name)
-        if case_number:
-            case_owner = get_case_owner(case_number)
-            if case_owner:
-                message = "Case owner for SR "+str(case_number)+" is: "+case_owner
-            else:
-                message = "No case found with SR "+str(case_number)
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns case title for provided case number
+def send_title(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/title", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            case_title = case.title
+            message = "Title for SR {} is: {}".format(case_number, case_title)
         else:
-            message = "Sorry, no case number was found."
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns case title for provided case number
+def send_device(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/device", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get device info from case
+            device_serial = case.serial
+            device_hostname = case.hostname
+            if device_serial:
+                message = "Device serial number for SR {} is: {}".format(case_number, device_serial)
+            else:
+                message = "Device serial number for SR {} is not provided".format(case_number)
+            if device_hostname:
+                message = message + "<br>Device hostname is {}".format(device_hostname)
+            else:
+                message = message + "<br>Device hostname not provided"
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns case description for provided case number
+def send_description(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+    # Get the details about the message that was sent.
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/description", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get case description
+            case_description = case.description
+            message = "Problem description for SR {} is: <br>{}".format(case_number, case_description)
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns the owner of the TAC case number provided
+def send_owner(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+    # Get the details about the message that was sent.
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/owner", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get owner info from case
+            owner_id = case.owner_id
+            owner_first = case.owner_first
+            owner_last = case.owner_last
+            owner_email = case.owner_email
+
+            message = "Case owner for SR {} is: {} {} ({})".format(case_number, owner_first, owner_last, owner_email)
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns contract number for provided case number
+def send_contract(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+    # Get the details about the message that was sent.
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/contract", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get case description
+            case_contract = case.contract
+            message = "The contract number used to open SR {} is: {}".format(case_number, case_contract)
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns the owner of the TAC case number provided
+def send_customer(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+    # Get the details about the message that was sent.
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/customer", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get owner info from case
+            customer_id = case.customer_id
+            customer_first = case.customer_first
+            customer_last = case.customer_last
+            customer_email = case.customer_email
+            customer_business = case.customer_business
+            customer_mobile = case.customer_mobile
+
+            message = "Customer contact for SR {} is: **{} {}**".format(case_number, customer_first, customer_last)
+            message = message + "<br>CCO ID: {}".format(customer_id)
+            message = message + "<br>Email: {}".format(customer_email) if customer_email else message
+            message = message + "<br>Business phone: {}".format(customer_business) if customer_business else message
+            message = message + "<br>Mobile phone: {}".format(customer_mobile) if customer_mobile else message
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns case status and severity for provided case number
+def send_status(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+    # Get the details about the message that was sent.
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/title", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get case status and severity
+            case_status = case.status
+            case_severity = case.severity
+            if "Closed" in case_status:
+                message = "Status for SR {} is {}".format(case_number, case_status)
+            else:
+                message = "Status for SR {} is {} and Severity is {}".format(case_number, case_status, case_severity)
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns the RMA numbers if any are associated with the case
+def send_rma_numbers(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+    # Get the details about the message that was sent.
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/rma", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    # Define URL for RMA lookup link
+    rma_url = "http://msvodb.cloudapps.cisco.com/support/serviceordertool/orderDetails.svo?orderNumber="
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get RMAs from case
+            rmas = case.rmas
+            if rmas is not None:
+                if type(rmas) is list:
+                    message = "The RMAs for SR {} are:\n".format(case_number)
+                    for r in rmas:
+                        message = message + "* <a href=\"{}{}\">{}</a>\n".format(rma_url, r, r)
+                else:
+                    message = "The RMA for SR {} is: <a href=\"{}{}\">{}</a>".format(case_number, rma_url, rmas,
+                                                                                     rmas)
+            else:
+                message = "There are no RMAs for SR {}".format(case_number)
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns the Bug IDs if any are associated with the case
+def send_bug(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+    # Get the details about the message that was sent.
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/bug", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    # Define URL for RMA lookup link
+    bug_url = "https://bst.cloudapps.cisco.com/bugsearch/bug/"
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get Bugs from case
+            bugs = case.bugs
+            if bugs is not None:
+                if type(bugs) is list:
+                    message = "The Bugs for SR {} are:\n".format(case_number)
+                    for b in bugs:
+                        message = message + "* <a href=\"{}{}\">{}</a>\n".format(bug_url, b, b)
+                else:
+                    message = "The Bug for SR {} is: <a href=\"{}{}\">{}</a>".format(case_number, bug_url, bugs,
+                                                                                     bugs)
+            else:
+                message = "There are no Bugs for SR {}".format(case_number)
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns case creation date for provided case number, and if case is still open return open duration as well
+def send_created(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/created", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get the creation datetime from the case details
+            case_create_date = case.created
+            case_create_date = datetime.strptime(case_create_date, '%Y-%m-%dT%H:%M:%SZ')
+            message = "Creation date for SR {} is: {}".format(case_number, case_create_date)
+
+            # Get time delta between creation and now; if case is still open, append with open duration
+            current_time = datetime.now()
+            current_time = current_time.replace(microsecond=0)
+            time_delta = current_time - case_create_date
+            status = case.status
+            if "Closed" not in status:
+                message = message + "<br>Case has been open for {}".format(time_delta)
+            else:
+                message = message + "<br>Case is now Closed"
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Returns case last updated date for provided case number, and if case is still open return duration since update as well
+def send_updated(post_data):
+    """
+    Due to the potentially sensitive nature of TAC case data, it is necessary (for the time being) to limit CASE API
+    access to Cisco employees and contractors, until such time as a more appropriate authentication method can be added
+    """
+    # Check if user is cisco.com
+    person_id = post_data["data"]["personId"]
+    email = get_email(person_id)
+    if not check_cisco_user(email):
+        return "Sorry, CASE API access is limited to Cisco Employees for the time being"
+
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/updated", message_in.text)
+
+    # Find case number
+    case_number = get_case_number(content, room_id)
+
+    if case_number:
+        # Create case object
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            # Get the update datetime from the case details
+            case_update_date = case.updated
+            case_update_date = datetime.strptime(case_update_date, '%Y-%m-%dT%H:%M:%SZ')
+            message = "Last update for SR {} was: {}".format(case_number, case_update_date)
+
+            # Get time delta between last updated and now
+            current_time = datetime.now()
+            current_time = current_time.replace(microsecond=0)
+            time_delta = current_time - case_update_date
+            status = case.status
+            if "Closed" in status:
+                message = message + "<br>Case is now Closed, {} since case closure".format(time_delta)
+            else:
+                # If case hasn't been updated in 3 days, make the text bold
+                if time_delta > timedelta(3):
+                    message = message + "<br>**{} since last update**".format(time_delta)
+                else:
+                    message = message + "<br>{} since last update".format(time_delta)
+        else:
+            message = "No case data found matching {}".format(case_number)
+    else:
+        message = "Invalid case number"
+
+    return message
+
+
+# Invite user by email or keyword
+def send_invite(post_data):
+    # Determine the Spark Room to send reply to
+    room_id = post_data["data"]["roomId"]
+
+    message_id = post_data["data"]["id"]
+    message_in = spark.messages.get(message_id)
+    content = extract_message("/invite ", message_in.text)
+
+    # Check for keywords
+    if content == "cse" or content == "CSE":
+        case_number = get_case_number(content, room_id)
+        case = CaseDetail(get_case_details(case_number))
+        if case.count > 0:
+            owner_email = case.owner_email
+            owner_first = case.owner_first
+            owner_last = case.owner_last
+            new_membership = invite_user(room_id, owner_email)
+            if new_membership:
+                message = "Case owner {} {} has been added to the room".format(owner_first, owner_last)
+            else:
+                message = "Unable to add Case owner to the room at this time"
+        else:
+            message = "Unable to add Case owner to the room at this time"
+    else:
+        email = check_email_syntax(content)
+        if email:
+            new_membership = invite_user(room_id, content)
+            if new_membership:
+                message = "User {} has been added to the room".format(content)
+            else:
+                message = "Unable to add user {} to the room".format(content)
+        else:
+            message = "Error, not a valid email address"
 
     return message
 
@@ -312,119 +955,23 @@ def send_echo(incoming):
 # Construct a help message for users.
 def send_help(post_data):
     message = "Hello!  "
-    message = message + "I understand the following commands:  \n"
+    message = message + "I understand the following commands.  \n"
+    message = message + "If case number is provided with the command, I will use that case number. \
+                        If none is provided, I will look in the Spark room name for a case number to use. \n"
     for c in commands.items():
         message = message + "* **%s**: %s \n" % (c[0], c[1])
     return message
+
 
 # Test command function that prints a test string
 def send_test():
     message = "This is a test message."
     return message
 
-# Supporting functions
-# Return contents following a given command
-def extract_message(command, text):
-    cmd_loc = text.find(command)
-    message = text[cmd_loc + len(command):]
-    return message
 
-# Get access-token for Case API
-def get_access_token():
-    client_id = os.environ.get("CASE_API_CLIENT_ID")
-    client_secret = os.environ.get("CASE_API_CLIENT_SECRET")
-    grant_type = "client_credentials"
-    url = "https://cloudsso.cisco.com/as/token.oauth2"
-    payload = "client_id="+client_id+"&grant_type=client_credentials&client_secret="+client_secret
-    headers = {
-        'accept': "application/json",
-        'content-type': "application/x-www-form-urlencoded",
-        'cache-control': "no-cache"
-    }
-    response = requests.request("POST", url, data=payload, headers=headers)
-    if (response.status_code == 200):
-        return response.json()['access_token']
-    else:
-        response.raise_for_status()
-
-# Get case title from CASE API
-def get_case_title(case_number):
-    access_token = get_access_token()
-
-    url = "https://api.cisco.com/case/v1.0/cases/details/case_ids/" + str(case_number)
-    headers = {
-        'authorization': "Bearer " + access_token,
-        'cache-control': "no-cache"
-    }
-    response = requests.request("GET", url, headers=headers)
-
-    if (response.status_code == 200):
-        # Uncomment to debug
-        # sys.stderr.write(response.text)
-
-        # Check if case was found
-        if response.json()['RESPONSE']['COUNT'] == 1:
-            title = response.json()['RESPONSE']['CASES']['CASE_DETAIL']['TITLE']
-            return title
-        else:
-            return False
-
-# Get case owner from CASE API
-def get_case_owner(case_number):
-    access_token = get_access_token()
-
-    url = "https://api.cisco.com/case/v1.0/cases/details/case_ids/" + str(case_number)
-    headers = {
-        'authorization': "Bearer " + access_token,
-        'cache-control': "no-cache"
-    }
-    response = requests.request("GET", url, headers=headers)
-
-    if (response.status_code == 200):
-        # Uncomment to debug
-        # sys.stderr.write(response.text)
-
-        # Check if case was found
-        if response.json()['RESPONSE']['COUNT'] == 1:
-            owner_id = response.json()['RESPONSE']['CASES']['CASE_DETAIL']['OWNER_USER_ID']
-            owner_first_name = response.json()['RESPONSE']['CASES']['CASE_DETAIL']['OWNER_FIRST_NAME']
-            owner_last_name = response.json()['RESPONSE']['CASES']['CASE_DETAIL']['OWNER_LAST_NAME']
-            owner_email = response.json()['RESPONSE']['CASES']['CASE_DETAIL']['OWNER_EMAIL_ADDRESS']
-            owner_string = owner_first_name+" "+owner_last_name+" ("+owner_email+")"
-            return owner_string
-        else:
-            return False
-
-
-# Get room name
-def get_room_name(room_id):
-    url = "https://api.ciscospark.com/v1/rooms/"+room_id
-
-    headers = {
-        'content-type': "application/json",
-        'authorization': "Bearer "+globals()["spark_token"],
-        'cache-control': "no-cache"
-        }
-
-    response = requests.request("GET", url, headers=headers)
-    if (response.status_code == 200):
-        return response.json()['title']
-    else:
-        response.raise_for_status()
-
-# Match case number in string
-def get_case_number(content):
-    # Check if there is a case number in the incoming message content
-    pattern = re.compile("([0-9]{9})")
-    match = pattern.search(content)
-
-    if match:
-        case_number = match.group(0)
-        return case_number
-    else:
-        return False
-
-
+#
+# Bot functions
+#
 
 # Setup the Spark connection and WebHook
 def spark_setup(email, token):
